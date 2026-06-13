@@ -1,0 +1,331 @@
+#!/bin/sh
+
+AUR_API='https://aur.archlinux.org/rpc/v5/info'
+AUR_CGIT='https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h='
+AUR_BASE='https://aur.archlinux.org'
+DEVEL_SUFFIXES="-git -hg -svn -bzr -cvs -darcs"
+
+keyboard_cancel() {
+    printf "\ncanceled. exiting...\n"
+    exit 130
+}
+trap keyboard_cancel INT
+
+check_git_installed() {
+    if ! command -v git >/dev/null 2>&1; then
+        echo "error: git is not installed :( please install git to use $0." >&2
+        exit 1
+    fi
+}
+
+# get foreign (aur only) packages and versions
+get_foreign_packages_function() {
+    pacman -Qm 2>/dev/null
+}
+
+# check if a package is a devel (vcs) package by suffix
+is_devel_package_function() {
+    _name="$1"
+    for _suffix in $DEVEL_SUFFIXES; do
+        case "$_name" in
+            *"$_suffix") return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# devel check: returns 0 if upstream changed, 1 if up to date
+check_devel_upstream_function() {
+    _pkg="$1"
+    _installed_ver="$2"
+    _tmpdir="$3"
+
+    _pkgdir="${_tmpdir}/${_pkg}"
+    mkdir -p "$_pkgdir"
+
+    _pkgbuild_url="${AUR_CGIT}${_pkg}"
+    if ! curl -sf "$_pkgbuild_url" -o "${_pkgdir}/PKGBUILD" 2>/dev/null; then
+        return 0
+    fi
+
+    # handle missing install files by creating dummies
+    _srcinfo=""
+    _attempt=0
+    while [ "$_attempt" -lt 3 ]; do
+        _srcinfo="$(cd "$_pkgdir" && makepkg --printsrcinfo 2>/dev/null)"
+        if [ -n "$_srcinfo" ]; then
+            break
+        fi
+        _missing="$(cd "$_pkgdir" && makepkg --printsrcinfo 2>&1 | sed -n "s/.*install file (\(.*\)) does not exist.*/\1/p")"
+        if [ -n "$_missing" ]; then
+            touch "${_pkgdir}/${_missing}"
+        else
+            break
+        fi
+        _attempt="$((_attempt + 1))"
+    done
+    if [ -z "$_srcinfo" ]; then
+        return 0
+    fi
+
+    _git_urls="$(echo "$_srcinfo" | sed -n 's/.*source = \(.*::\)\{0,1\}git+\(.*\)/\2/p')"
+    if [ -z "$_git_urls" ]; then
+        return 0
+    fi
+
+    # strip pkgrel, grab trailing hex >= 7 chars from version
+    _installed_hash="$(echo "$_installed_ver" | sed 's/-[0-9]*$//' | grep -oE '[0-9a-f]{7,}$' | head -1)"
+    if [ -z "$_installed_hash" ]; then
+        return 0
+    fi
+
+    # avoid pipe to keep exit codes in this shell (no subshell)
+    _urls_file="${_tmpdir}/urls"
+    echo "$_git_urls" > "$_urls_file"
+    while read -r _git_url; do
+        if [ -z "$_git_url" ]; then
+            continue
+        fi
+
+        _check_url="$(echo "$_git_url" | sed 's/\.git$//')"
+        _remote_head="$(git ls-remote "$_check_url" HEAD 2>/dev/null | cut -f1)"
+        if [ -z "$_remote_head" ]; then
+            continue
+        fi
+
+        # compare: installed hash should be prefix of remote head
+        case "$_remote_head" in
+            "${_installed_hash}"*)
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done < "$_urls_file"
+
+    # all sources match
+    return 1
+}
+
+# filter devel false positives from updates
+filter_devel_updates_function() {
+    _updates="$1"
+    _tmpdir="$2"
+    _updates_file="${_tmpdir}/updates"
+    _filtered_file="${_tmpdir}/filtered"
+
+    echo "$_updates" > "$_updates_file"
+    : > "$_filtered_file"
+
+    while IFS='	' read -r _name _local _remote; do
+        if is_devel_package_function "$_name"; then
+            if check_devel_upstream_function "$_name" "$_local" "$_tmpdir"; then
+                printf '%s\t%s\t%s\n' "$_name" "$_local" "$_remote" >> "$_filtered_file"
+            fi
+        else
+            printf '%s\t%s\t%s\n' "$_name" "$_local" "$_remote" >> "$_filtered_file"
+        fi
+    done < "$_updates_file"
+
+    cat "$_filtered_file"
+}
+
+# query the aur api and return package info as tsv: name \t local_ver \t remote_ver
+check_updates_function() {
+    _foreign="$(get_foreign_packages_function)"
+    if [ -z "$_foreign" ]; then
+        echo ""
+        return
+    fi
+
+    _pkg_list=""
+    _local_versions=""
+    while IFS=' ' read -r _name _ver; do
+        if [ -z "$_name" ]; then
+            continue
+        fi
+        if [ -z "$_pkg_list" ]; then
+            _pkg_list="arg[]=${_name}"
+            _local_versions="${_name} ${_ver}"
+        else
+            _pkg_list="${_pkg_list}&arg[]=${_name}"
+            _local_versions="${_local_versions}\n${_name} ${_ver}"
+        fi
+    done <<EOF
+$_foreign
+EOF
+
+    if [ -z "$_pkg_list" ]; then
+        echo ""
+        return
+    fi
+
+    _response="$(curl -sf "${AUR_API}?${_pkg_list}" 2>/dev/null)"
+    if [ -z "$_response" ]; then
+        echo "error: failed to query aur api" >&2
+        echo ""
+        return
+    fi
+
+    _updates="$(printf '%s\n' "$_response" | python3 -c "
+import sys, json
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+results = data.get('results', [])
+if not results:
+    sys.exit(0)
+
+local = {}
+for line in '''$_local_versions'''.strip().split('\n'):
+    parts = line.strip().split(' ', 1)
+    if len(parts) == 2:
+        local[parts[0]] = parts[1]
+
+for pkg in results:
+    name = pkg.get('Name', '')
+    remote_ver = pkg.get('Version', '')
+    local_ver = local.get(name, '')
+    if name and remote_ver and remote_ver != local_ver:
+        print(f'{name}\t{local_ver}\t{remote_ver}')
+" 2>/dev/null)"
+
+    echo "$_updates"
+}
+
+# download a single pkgbuild using gitaur or git clone fallback
+download_pkg_function() {
+    _pkg="$1"
+    _dest="$2"
+
+    if [ -n "$_dest" ]; then
+        mkdir -p "$_dest"
+        _target="${_dest}/${_pkg}"
+    else
+        _target="$_pkg"
+    fi
+
+    if [ -d "$_target" ]; then
+        echo "  skipping ${_pkg}: directory already exists"
+        return
+    fi
+
+    if command -v gitaur >/dev/null 2>&1; then
+        if [ -n "$_dest" ]; then
+            (cd "$_dest" && gitaur "$_pkg")
+        else
+            gitaur "$_pkg"
+        fi
+    else
+        git clone "${AUR_BASE}/${_pkg}.git" "$_target"
+    fi
+}
+
+usage_function() {
+    cat <<EOF
+usage:
+    $0 [-h|--help]
+    $0 [-d <dir>]
+
+check for aur package updates and optionally download updated pkgbuilds.
+
+options:
+    -h, --help
+        print this help message
+    -d, --dir <dir>
+        download pkgbuilds into <dir> instead of current directory
+EOF
+}
+
+# argument parsing
+_download_dir=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage_function
+            exit 0
+            ;;
+        -d|--dir)
+            if [ -z "$2" ]; then
+                echo "error: --dir requires a path argument" >&2
+                exit 1
+            fi
+            _download_dir="$2"
+            shift 2
+            ;;
+        -*)
+            echo "error: unknown option: $1" >&2
+            usage_function
+            exit 1
+            ;;
+        *)
+            echo "error: unexpected argument: $1" >&2
+            usage_function
+            exit 1
+            ;;
+    esac
+done
+
+# main
+check_git_installed
+
+_updates="$(check_updates_function)"
+
+if [ -z "$_updates" ]; then
+    echo "no aur updates found."
+    exit 0
+fi
+
+_tmpdir="$(mktemp -d)"
+_updates="$(filter_devel_updates_function "$_updates" "$_tmpdir")"
+rm -rf "$_tmpdir"
+
+if [ -z "$_updates" ]; then
+    echo "no aur updates found."
+    exit 0
+fi
+
+# display updates
+printf "\naur packages with updates:\n\n"
+{
+    printf "package\tinstalled\tavailable\n"
+    printf -- "---\t---\t---\n"
+    echo "$_updates"
+} | column -t -s '	'
+printf "\n"
+
+# prompt for download
+_count="$(echo "$_updates" | wc -l | tr -d ' ')"
+printf "download all %s updated pkgbuilds? [Y/n] " "$_count"
+read -r _answer
+
+case "$_answer" in
+    [nN]|[nN][oO])
+        echo "skipping download."
+        exit 0
+        ;;
+    *)
+        ;;
+esac
+
+if [ -z "$_download_dir" ]; then
+    printf "download directory (default: current dir): "
+    read -r _dir_input
+    if [ -n "$_dir_input" ]; then
+        _download_dir="$_dir_input"
+    fi
+fi
+
+# download in parallel
+echo "$_updates" | while IFS='	' read -r _name _local _remote; do
+    download_pkg_function "$_name" "$_download_dir" &
+done
+wait
+
+echo "done."
+
+# vim: set filetype=sh foldmethod=marker foldlevel=0:
