@@ -273,6 +273,7 @@ done
 # main
 check_git_installed
 
+echo "checking for aur updates..."
 _updates="$(check_updates_function)"
 
 if [ -z "$_updates" ]; then
