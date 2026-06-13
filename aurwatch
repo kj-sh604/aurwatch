@@ -3,7 +3,6 @@
 AUR_API='https://aur.archlinux.org/rpc/v5/info'
 AUR_CGIT='https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h='
 AUR_BASE='https://aur.archlinux.org'
-DEVEL_SUFFIXES="-git -hg -svn -bzr -cvs -darcs"
 
 keyboard_cancel() {
     printf "\ncanceled. exiting...\n"
@@ -27,12 +26,9 @@ get_foreign_packages_function() {
 
 # check if a package is a devel (vcs) package by suffix
 is_devel_package_function() {
-    _name="$1"
-    for _suffix in $DEVEL_SUFFIXES; do
-        case "$_name" in
-            *"$_suffix") return 0 ;;
-        esac
-    done
+    case "$1" in
+        *-git|*-hg|*-svn|*-bzr|*-cvs|*-darcs) return 0 ;;
+    esac
     return 1
 }
 
@@ -70,13 +66,13 @@ check_devel_upstream_function() {
         return 0
     fi
 
-    _git_urls="$(echo "$_srcinfo" | sed -n 's/.*source = \(.*::\)\{0,1\}git+\(.*\)/\2/p')"
+    _git_urls="$(echo "$_srcinfo" | awk '/source = .*git\+/ { sub(/.*git\+/, ""); sub(/\.git$/, ""); print }')"
     if [ -z "$_git_urls" ]; then
         return 0
     fi
 
     # strip pkgrel, grab trailing hex >= 7 chars from version
-    _installed_hash="$(echo "$_installed_ver" | sed 's/-[0-9]*$//' | grep -oE '[0-9a-f]{7,}$' | head -1)"
+    _installed_hash="$(echo "$_installed_ver" | awk '{ sub(/-[0-9]+$/, ""); if (match($0, /[0-9a-f]{7,}$/)) print substr($0, RSTART, RLENGTH) }')"
     if [ -z "$_installed_hash" ]; then
         return 0
     fi
@@ -141,16 +137,23 @@ check_updates_function() {
     fi
 
     _pkg_list=""
-    _local_json="{}"
+    _local_json="{"
+    _first_pkg=1
     while IFS=' ' read -r _name _ver; do
         if [ -z "$_name" ]; then
             continue
         fi
         _pkg_list="${_pkg_list:+${_pkg_list}&}arg[]=${_name}"
-        _local_json="$(printf '%s' "$_local_json" | jq --arg k "$_name" --arg v "$_ver" '. + {($k): $v}')"
+        if [ "$_first_pkg" -eq 1 ]; then
+            _local_json="${_local_json}\"${_name}\":\"${_ver}\""
+            _first_pkg=0
+        else
+            _local_json="${_local_json},\"${_name}\":\"${_ver}\""
+        fi
     done <<EOF
 $_foreign
 EOF
+    _local_json="${_local_json}}"
 
     if [ -z "$_pkg_list" ]; then
         echo ""
