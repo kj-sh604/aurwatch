@@ -299,6 +299,12 @@ if [ -z "$_download_dir" ]; then
     fi
 fi
 
+# expand tilde to home directory
+case "$_download_dir" in
+    "~") _download_dir="$HOME" ;;
+    "~/"*) _download_dir="${HOME}/${_download_dir#\~/}" ;;
+esac
+
 # download in parallel
 echo "$_updates" | while IFS='	' read -r _name _local _remote; do
     download_pkg_function "$_name" "$_download_dir" &
