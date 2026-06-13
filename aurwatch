@@ -11,11 +11,13 @@ keyboard_cancel() {
 }
 trap keyboard_cancel INT
 
-check_git_installed() {
-    if ! command -v git >/dev/null 2>&1; then
-        echo "error: git is not installed :( please install git to use $0." >&2
-        exit 1
-    fi
+check_deps_function() {
+    for _dep in curl jq git makepkg; do
+        if ! command -v "$_dep" >/dev/null 2>&1; then
+            echo "error: $_dep is not installed :( please install $_dep to use $0." >&2
+            exit 1
+        fi
+    done
 }
 
 # get foreign (aur only) packages and versions
@@ -139,18 +141,13 @@ check_updates_function() {
     fi
 
     _pkg_list=""
-    _local_versions=""
+    _local_json="{}"
     while IFS=' ' read -r _name _ver; do
         if [ -z "$_name" ]; then
             continue
         fi
-        if [ -z "$_pkg_list" ]; then
-            _pkg_list="arg[]=${_name}"
-            _local_versions="${_name} ${_ver}"
-        else
-            _pkg_list="${_pkg_list}&arg[]=${_name}"
-            _local_versions="${_local_versions}\n${_name} ${_ver}"
-        fi
+        _pkg_list="${_pkg_list:+${_pkg_list}&}arg[]=${_name}"
+        _local_json="$(printf '%s' "$_local_json" | jq --arg k "$_name" --arg v "$_ver" '. + {($k): $v}')"
     done <<EOF
 $_foreign
 EOF
@@ -167,31 +164,12 @@ EOF
         return
     fi
 
-    _updates="$(printf '%s\n' "$_response" | python3 -c "
-import sys, json
-
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-
-results = data.get('results', [])
-if not results:
-    sys.exit(0)
-
-local = {}
-for line in '''$_local_versions'''.strip().split('\n'):
-    parts = line.strip().split(' ', 1)
-    if len(parts) == 2:
-        local[parts[0]] = parts[1]
-
-for pkg in results:
-    name = pkg.get('Name', '')
-    remote_ver = pkg.get('Version', '')
-    local_ver = local.get(name, '')
-    if name and remote_ver and remote_ver != local_ver:
-        print(f'{name}\t{local_ver}\t{remote_ver}')
-" 2>/dev/null)"
+    _updates="$(printf '%s' "$_response" | jq -r --argjson local "$_local_json" '
+        [.results[] | {name: .Name, remote: .Version}]
+        | map(.local = $local[.name])
+        | map(select(.local != null and .local != .remote))
+        | .[] | [.name, .local, .remote] | @tsv
+    ' 2>/dev/null)"
 
     echo "$_updates"
 }
@@ -271,7 +249,7 @@ while [ $# -gt 0 ]; do
 done
 
 # main
-check_git_installed
+check_deps_function
 
 echo "checking for aur updates..."
 _updates="$(check_updates_function)"

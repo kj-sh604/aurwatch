@@ -1,15 +1,17 @@
 # aurwatch
 
-check for aur package updates and optionally download updated pkgbuilds.
+Check for AUR package updates and optionally download the updated PKGBUILDs.
 
-queries the aur rpc api for foreign packages, filters out devel (-git, -hg, -svn, etc.) false positives by checking upstream repos for new commits, then prompts to download the updated pkgbuilds.
+Queries the AUR RPC API for foreign packages, filters out devel (-git, -hg,
+-svn, etc.) false positives by checking upstream repos for new commits, then
+prompts to download the updated PKGBUILDs.
 
 ## Arch Linux Dependencies (System Packages)
 
 - pacman (libalpm)
 - curl
 - git
-- python (for json parsing)
+- jq
 - makepkg (pacman, for devel source expansion)
 
 ## Quick Run
@@ -41,13 +43,15 @@ make remove
 
 ## How It Works
 
-lists foreign packages with version mismatches against the aur.
+Lists foreign packages with version mismatches against the AUR.
 
-for devel packages (vcs suffixes), fetches the pkgbuild, runs makepkg --printsrcinfo to expand source urls, then compares the installed commit hash against git ls-remote HEAD. 
+For devel packages (VCS suffixes), fetches the PKGBUILD, runs `makepkg
+--printsrcinfo` to expand source URLs, then compares the installed commit
+hash against `git ls-remote HEAD`.
 
-only shows a devel update if upstream has actually moved.
+Only shows a devel update if upstream has actually moved.
 
-uses gitaur from path if available, falls back to plain git clone.
+Uses `gitaur` from PATH if available, falls back to plain `git clone`.
 
 ## License
 
